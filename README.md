@@ -10,7 +10,7 @@ infrastructure.
 
 ### Making Streetlights
 
-![App Screenshot](Photos/making-streetlights.jpg)
+![App Screenshot](Photos/making_streetlights.jpg)
 
 ### Soldering
 
@@ -18,8 +18,8 @@ infrastructure.
 
 ### Streetlight
 
-![App Screenshot](Photos/streetlight-image.jpg)
+![App Screenshot](Photos/streetlight_image.jpg)
 
 ### Gluing
 
-![App Screenshot](Photos/streetlights-glued-to-wooden-plank.jpg)
+![App Screenshot](Photos/streetlights_glued_to_wooden_plank.jpg)
