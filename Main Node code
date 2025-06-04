@@ -1,0 +1,182 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+
+// Wi-Fi & Adafruit IO
+#define WIFI_SSID     "007"
+#define WIFI_PASSWORD "udhay123"
+#define IO_USERNAME   "vamsi1"
+#define IO_KEY        "Your IO Key"
+#define AIO_SERVER    "io.adafruit.com"
+#define AIO_SERVERPORT 1883
+
+// GSM (SIM800L) on ESP32 UART2 (TX2=GPIO17, RX2=GPIO16)
+#define GSM_RX_PIN    16
+#define GSM_TX_PIN    17
+#define ALERT_NUMBER  "+91XXXXXXXXXX"  // <-- your destination number
+HardwareSerial GSM(2);
+
+WiFiClient client;
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, IO_USERNAME, IO_KEY);
+
+// Toggle Subscriptions
+Adafruit_MQTT_Subscribe ir_toggle  = Adafruit_MQTT_Subscribe(&mqtt, IO_USERNAME "/feeds/IR");
+Adafruit_MQTT_Subscribe ldr_toggle = Adafruit_MQTT_Subscribe(&mqtt, IO_USERNAME "/feeds/LDR");
+
+// Light Feed Publishers
+Adafruit_MQTT_Publish lightStatus[8] = {
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/L1"),
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/L2"),
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/L3"),
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/L4"),
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/R1"),
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/R2"),
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/R3"),
+  Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/R4")
+};
+
+// LoRa Pins
+#define SCK   21
+#define MISO  19
+#define MOSI  18
+#define SS    5
+#define RST   14
+#define DIO0  2
+
+bool lastIR = true;
+bool lastLDR = true;
+unsigned long lastConfigSendTime = 0;
+const unsigned long CONFIG_RESEND_INTERVAL = 3000; // 1.5 sec
+
+// helper to send SMS via SIM800L
+void sendSMS(const String &number, const String &text) {
+  GSM.print("AT+CMGS=\""); 
+  GSM.print(number);
+  GSM.println("\"");
+  delay(100);
+  GSM.print(text);
+  delay(100);
+  GSM.write(26);   // CTRL+Z to send
+  delay(1000);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // init GSM
+  GSM.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+  delay(1000);
+  GSM.println("AT");
+  delay(100);
+  GSM.println("AT+CMGF=1");      // text mode
+  delay(100);
+  GSM.println("AT+CNMI=1,2,0,0,0"); // new SMS auto-print off
+  delay(100);
+
+  // init LoRa
+  SPI.begin(SCK, MISO, MOSI, SS);
+  LoRa.setPins(SS, RST, DIO0);
+  LoRa.setTxPower(20);
+  if (!LoRa.begin(433E6)) {
+    Serial.println("LoRa init failed!");
+    while (1);
+  }
+
+  // init WiFi + MQTT
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  mqtt.subscribe(&ir_toggle);
+  mqtt.subscribe(&ldr_toggle);
+  Serial.println("Central Node Started");
+}
+
+void loop() {
+  MQTT_connect();
+  checkTogglesAndSend();
+  handleLoRa();
+  resendConfigPeriodically();
+}
+
+void handleLoRa() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize > 0) {
+    String received = "";
+    while (LoRa.available()) received += (char)LoRa.read();
+    Serial.println("LoRa Received: " + received);
+    if (received.startsWith("B1:")) updateBatchFeeds(received.substring(3), 0);
+    else if (received.startsWith("B2:")) updateBatchFeeds(received.substring(3), 4);
+    else if (received.startsWith("REQ_CFG:")) sendConfigToBatch(received.substring(8));
+  }
+}
+
+void updateBatchFeeds(String data, int startIndex) {
+  String failedLights = "";
+  for (int i = 0; i < data.length(); i++) {
+    char c = data.charAt(i);
+    // publish exactly as before
+    if ((c == '0' || c == '1') && startIndex + i < 8) {
+      lightStatus[startIndex + i].publish(String(c).c_str());
+    }
+    // collect failures ('0' = failed)
+    if (c == '0' && startIndex + i < 8) {
+      if (failedLights.length()) failedLights += ",";
+      // light numbering 1–8
+      failedLights += String(startIndex + i + 1);
+    }
+  }
+  // if any failures, send one SMS listing them
+  if (failedLights.length()) {
+    int batchNum = (startIndex < 4) ? 1 : 2;
+    String msg = "Batch " + String(batchNum) + " failed lights: " + failedLights;
+    sendSMS(ALERT_NUMBER, msg);
+  }
+}
+
+void checkTogglesAndSend() {
+  bool irState = lastIR;
+  bool ldrState = lastLDR;
+  Adafruit_MQTT_Subscribe *sub;
+  while ((sub = mqtt.readSubscription(100))) {
+    if (sub == &ir_toggle)  irState  = strcmp((char*)ir_toggle .lastread, "1") == 0;
+    if (sub == &ldr_toggle) ldrState = strcmp((char*)ldr_toggle.lastread, "1") == 0;
+  }
+  if (irState != lastIR || ldrState != lastLDR) {
+    lastIR  = irState;
+    lastLDR = ldrState;
+    sendConfigToAllBatches();
+  }
+}
+
+void sendConfigToAllBatches() {
+  for (int b = 1; b <= 2; b++) sendConfigToBatch(String(b));
+  lastConfigSendTime = millis();
+}
+
+bool sendConfigToBatch(String batchID) {
+  String config = "CFG:B" + batchID + "|IR:" + String(lastIR  ? 1 : 0)
+                                + "|LDR:" + String(lastLDR ? 1 : 0);
+  LoRa.beginPacket();
+  LoRa.print(config);
+  bool success = LoRa.endPacket();
+  if (!success) Serial.println("Failed to send to B" + batchID);
+  else        Serial.println("Sent to B" + batchID + ": " + config);
+  delay(500);
+  return success;
+}
+
+void resendConfigPeriodically() {
+  if (millis() - lastConfigSendTime > CONFIG_RESEND_INTERVAL) {
+    sendConfigToAllBatches();
+  }
+}
+
+void MQTT_connect() {
+  if (mqtt.connected()) return;
+  while (mqtt.connect() != 0) {
+    Serial.print(".");
+    delay(1000);
+  }
+  Serial.println("\nConnected to Adafruit IO!");
+}
