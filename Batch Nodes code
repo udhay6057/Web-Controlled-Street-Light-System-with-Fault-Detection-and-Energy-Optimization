@@ -1,1 +1,181 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+// Pins & Config
+#define RELAY1 33
+#define RELAY2 27
+#define RELAY3 26
+#define RELAY4 25
+#define IR_ENTRY 16
+#define IR_EXIT 17
+#define LDR_SKY 4
+#define LDR1 35
+#define LDR2 34
+#define LDR3 39
+#define LDR4 36
+
+#define SCK  21
+#define MISO 19
+#define MOSI 18
+#define SS   5
+#define RST  14
+#define DIO0 2
+
+String BATCH_ID = "B1"; // Change to "B2" for second batch and soo on 
+
+int relayPins[4] = { RELAY1, RELAY2, RELAY3, RELAY4 };
+int ldrPins[4] = { LDR1, LDR2, LDR3, LDR4 };
+int prevLdrStatus[4] = { -1, -1, -1, -1 };
+
+bool irEnabled = true;
+bool ldrEnabled = true;
+bool motionDetected = false;
+bool isDaylight = false;
+unsigned long lastMotionTime = 0;
+const unsigned long MOTION_TIMEOUT = 300000; // 5 minutes
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(IR_ENTRY, INPUT);
+  pinMode(IR_EXIT, INPUT);
+  pinMode(LDR_SKY, INPUT);
+  for (int i = 0; i < 4; i++) {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], HIGH); // Start OFF
+  }
+
+  SPI.begin(SCK, MISO, MOSI, SS);
+  LoRa.setPins(SS, RST, DIO0);
+  LoRa.setTxPower(20);
+  if (!LoRa.begin(433E6)) {
+    Serial.println("LoRa init failed!");
+    while (1);
+  }
+  Serial.println("Batch Node Started - " + BATCH_ID);
+}
+
+void loop() {
+  handleLoRaReceive();
+  isDaylight = !digitalRead(LDR_SKY); // Active LOW (dark = LOW)
+
+  // --- Light Control Logic ---
+  if (ldrEnabled && isDaylight) {
+    allRelaysOffSequential(); // Daylight → OFF
+  } 
+  else if (!irEnabled && ldrEnabled && !isDaylight) {
+    allRelaysOnSequential(); // LDR-only mode → ON at night
+  } 
+  else if (irEnabled) {
+    bool isMotionEntry = !digitalRead(IR_ENTRY);
+    bool isMotionExit = !digitalRead(IR_EXIT);
+    handleIRControl(isMotionEntry, isMotionExit); // IR-controlled
+  } 
+  else {
+    allRelaysOffSequential(); // Default OFF
+  }
+
+  sendLDRStatusIfChanged();
+  delay(1000);
+}
+
+// Sequential ON/OFF (100ms delay between lights)
+void allRelaysOnSequential() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(relayPins[i], LOW);
+    delay(100);
+  }
+}
+
+void allRelaysOffSequential() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(relayPins[i], HIGH);
+    delay(100);
+  }
+}
+
+void handleIRControl(bool motionIn, bool motionOut) {
+  if (!irEnabled) {
+    // If IR is disabled, do not control lights based on motion
+    Serial.println("IR is disabled, motion detection ignored.");
+    return;
+  }
+
+  // Motion In: Lights ON sequentially
+  if (motionIn && !motionDetected) {
+    motionDetected = true;
+    lastMotionTime = millis();
+    allRelaysOnSequential();
+    Serial.println("Motion detected → Lights ON");
+  } 
+  // Motion Out: Lights OFF sequentially
+  else if (motionOut && motionDetected) {
+    motionDetected = false;
+    allRelaysOffSequential();
+    Serial.println("Motion ended → Lights OFF");
+  } 
+  // Timeout after a period of no motion
+  else if (motionDetected && (millis() - lastMotionTime > MOTION_TIMEOUT)) {
+    motionDetected = false;
+    allRelaysOffSequential();
+    Serial.println("Motion timeout → Lights OFF");
+  }
+}
+
+void handleLoRaReceive() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize > 0) {
+    String received = "";
+    while (LoRa.available()) received += (char)LoRa.read();
+    Serial.println("LoRa Received: " + received);
+
+    if (received.startsWith("CFG:" + BATCH_ID + "|")) {
+      int irStart = received.indexOf("IR:");
+      int ldrStart = received.indexOf("LDR:");
+
+      if (irStart != -1 && ldrStart != -1) {
+        String irVal = received.substring(irStart + 3, received.indexOf('|', irStart));
+        String ldrVal = received.substring(ldrStart + 4, received.indexOf('|', ldrStart));
+
+        irEnabled = irVal == "1";
+        ldrEnabled = ldrVal == "1";
+
+        // Reset motionDetected when toggling IR and LDR
+        if (!irEnabled) {
+          motionDetected = false; // Reset motion detection if IR is disabled
+        }
+
+        Serial.println("Updated Config → IR: " + String(irEnabled) + ", LDR: " + String(ldrEnabled));
+      }
+    }
+  }
+}
+
+void sendLDRStatusIfChanged() {
+  int currentStatus[4];
+  bool changed = false;
+
+  for (int i = 0; i < 4; i++) {
+    if (digitalRead(relayPins[i]) == LOW) {
+      int val = analogRead(ldrPins[i]);
+      currentStatus[i] = val < 2000 ? 0 : 1; // Adjust threshold as needed
+      if (prevLdrStatus[i] != currentStatus[i]) {
+        prevLdrStatus[i] = currentStatus[i];
+        changed = true;
+      }
+    } else {
+      currentStatus[i] = -1;
+    }
+  }
+
+  if (changed) {
+    String packet = BATCH_ID + ":";
+    for (int i = 0; i < 4; i++) {
+      packet += currentStatus[i] != -1 ? String(currentStatus[i]) : "X";
+    }
+    LoRa.beginPacket();
+    LoRa.print(packet);
+    LoRa.endPacket();
+    Serial.println("Sent: " + packet);
+  }
+}
 
