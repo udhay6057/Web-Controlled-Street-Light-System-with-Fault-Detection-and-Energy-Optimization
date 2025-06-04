@@ -18,7 +18,7 @@ infrastructure.
 
 ### Streetlight
 
-![App Screenshot](Photos/streetlight_image.jpg)
+![App Screenshot](Photos/final_project.jpg)
 
 ### Gluing
 
